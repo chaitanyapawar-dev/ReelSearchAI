@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+yt-dlp
+python-multipart
+faster-whisper
+sentence-transformers
+chromadb

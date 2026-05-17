@@ -1,0 +1,38 @@
+# ============================================================
+# Reel Saver AI — Root .gitignore
+# ============================================================
+
+# ---- Python (backend) ----
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/.env
+
+# Downloaded media files (large binary files — not for git)
+backend/downloads/*.mp4
+backend/downloads/*.mp3
+backend/downloads/*.webm
+backend/downloads/audio/
+backend/downloads/transcripts/
+
+# ChromaDB vector store (local-only binary data)
+backend/vector_db/
+
+# Search evaluation logs (local runtime data)
+backend/search_logs/
+
+# ---- Node / Next.js (frontend) ----
+frontend/node_modules/
+frontend/.next/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# ---- OS & Editor ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
