@@ -5,3 +5,5 @@ python-multipart
 faster-whisper
 sentence-transformers
 chromadb
+easyocr
+opencv-python

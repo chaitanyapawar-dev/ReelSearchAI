@@ -687,3 +687,64 @@ h1 {
 .analytics-score-bad {
   color: #b71c1c;
 }
+
+/* =========================================================
+   Step 8 — OCR styles
+   ========================================================= */
+
+.badge-ocr {
+  background: #e8f0fe;
+  color: #1a3a8a;
+  border: 1px solid #b0c4f8;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+
+.badge-ocr-none {
+  background: #f5f5f5;
+  color: #999;
+  border: 1px solid #ddd;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-weight: 400;
+}
+
+.preset-btn-ocr {
+  border-color: #1a3a8a;
+  background: #f0f4ff;
+  color: #1a3a8a;
+}
+
+.preset-btn-ocr:hover {
+  background: #e0e8ff;
+}
+
+.ocr-preview-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 6px 0 4px;
+  padding: 6px 8px;
+  background: #f0f4ff;
+  border: 1px solid #d0daff;
+  border-radius: 3px;
+}
+
+.ocr-label {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: #1a3a8a;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.ocr-preview-text {
+  font-size: 0.83rem;
+  color: #333;
+  font-style: italic;
+  line-height: 1.5;
+}

@@ -11,6 +11,7 @@ const STEPS = [
   "Extracting MP3",
   "Transcribing audio",
   "Saving transcript",
+  "Extracting on-screen text (OCR)",
   "Storing embedding",
   "Completed",
 ];
@@ -27,6 +28,15 @@ const PRESET_ENGLISH = [
   "productivity mindset",
   "gym discipline",
   "self improvement",
+];
+
+// Step 8 — OCR-enhanced preset queries
+const PRESET_OCR = [
+  "dopamine detox quote",
+  "discipline caption reel",
+  "productivity subtitle reel",
+  "Hindi motivational quote",
+  "startup text reel",
 ];
 
 const PRESET_HINGLISH = [
@@ -46,6 +56,9 @@ type DownloadResult = {
   audio_filename: string;
   transcript_filename: string;
   transcript_preview: string;
+  ocr_filename: string;
+  ocr_success: boolean;
+  ocr_text_preview: string;
 };
 
 type SearchResult = {
@@ -55,6 +68,8 @@ type SearchResult = {
   transcript_preview: string;
   transcript_length: number;
   original_url: string;
+  ocr_success: boolean;
+  ocr_text_preview: string;
 };
 
 type SearchResponse = {
@@ -74,6 +89,9 @@ type LibraryReel = {
   video_exists: boolean;
   audio_exists: boolean;
   transcript_exists: boolean;
+  ocr_success: boolean;
+  ocr_text_preview: string;
+  ocr_exists: boolean;
 };
 
 type Analytics = {
@@ -227,14 +245,14 @@ export default function Home() {
     setCurrentStep(0);
     timerRef.current = setInterval(() => {
       step += 1;
-      if (step <= 5) setCurrentStep(step);
+      if (step <= 6) setCurrentStep(step);
       else if (timerRef.current) clearInterval(timerRef.current);
     }, 4000);
   }
 
   function stopSimulation(success: boolean) {
     if (timerRef.current) clearInterval(timerRef.current);
-    setCurrentStep(success ? 6 : -1);
+    setCurrentStep(success ? 7 : -1);
   }
 
   // ---------------------------------------------------------------------------
@@ -460,8 +478,22 @@ export default function Home() {
                 <tr><td className="file-label">Video</td><td><code>{downloadResult.video_filename}</code></td></tr>
                 <tr><td className="file-label">Audio</td><td><code>{downloadResult.audio_filename}</code></td></tr>
                 <tr><td className="file-label">Transcript</td><td><code>{downloadResult.transcript_filename}</code></td></tr>
+                <tr>
+                  <td className="file-label">OCR</td>
+                  <td>
+                    {downloadResult.ocr_success
+                      ? <><span className="badge badge-ocr">✔ OCR detected</span> <code>{downloadResult.ocr_filename}</code></>
+                      : <span className="badge badge-ocr-none">— No on-screen text detected</span>}
+                  </td>
+                </tr>
               </tbody>
             </table>
+            {downloadResult.ocr_success && downloadResult.ocr_text_preview && (
+              <div className="media-section">
+                <h3>OCR Extracted Text</h3>
+                <TranscriptBox text={downloadResult.ocr_text_preview} />
+              </div>
+            )}
             <div className="media-section">
               <h3>Video Preview</h3>
               <video controls src={`${BASE}/${downloadResult.video_filename}`} className="video-player" />
@@ -549,7 +581,16 @@ export default function Home() {
               <span className={`badge ${reel.video_exists ? "badge-ok" : "badge-missing"}`}>{reel.video_exists ? "✔ Video" : "✘ Video missing"}</span>
               <span className={`badge ${reel.audio_exists ? "badge-ok" : "badge-missing"}`}>{reel.audio_exists ? "✔ Audio" : "✘ Audio missing"}</span>
               <span className={`badge ${reel.transcript_exists ? "badge-ok" : "badge-missing"}`}>{reel.transcript_exists ? "✔ Transcript" : "✘ Transcript missing"}</span>
+              {reel.ocr_success
+                ? <span className="badge badge-ocr">👁 OCR text</span>
+                : <span className="badge badge-ocr-none">— No OCR</span>}
             </div>
+            {reel.ocr_success && reel.ocr_text_preview && (
+              <div className="ocr-preview-row">
+                <span className="ocr-label">OCR:</span>
+                <span className="ocr-preview-text">{reel.ocr_text_preview.slice(0, 120)}{reel.ocr_text_preview.length > 120 ? "…" : ""}</span>
+              </div>
+            )}
             {reel.video_exists && reel.video_filename && (
               <video controls src={`${BASE}/${reel.video_filename}`} className="video-player" />
             )}
@@ -616,6 +657,18 @@ export default function Home() {
           </div>
         </div>
 
+        {/* OCR presets */}
+        <div className="preset-group">
+          <p className="preset-label">OCR / caption presets</p>
+          <div className="preset-row">
+            {PRESET_OCR.map((p) => (
+              <button key={p} className="preset-btn preset-btn-ocr" onClick={() => runEvalSearch(p)} disabled={evalSearching}>
+                {p}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {/* Timing */}
         {evalTime && (
           <p className="eval-timing">⏱ Search completed in {evalTime}</p>
@@ -670,6 +723,14 @@ export default function Home() {
                 {fb && <span className="feedback-saved">Saved ✓</span>}
               </div>
 
+              {/* OCR info inline */}
+              {r.ocr_success && r.ocr_text_preview && (
+                <div className="ocr-preview-row">
+                  <span className="ocr-label">OCR:</span>
+                  <span className="ocr-preview-text">{r.ocr_text_preview.slice(0, 120)}{r.ocr_text_preview.length > 120 ? "…" : ""}</span>
+                </div>
+              )}
+
               {/* Debug panel */}
               {showDebug && (
                 <div className="debug-panel">
@@ -677,6 +738,7 @@ export default function Home() {
                   <p><strong>Raw similarity:</strong> {r.similarity_score}</p>
                   <p><strong>Transcript length:</strong> {r.transcript_length} chars</p>
                   <p><strong>Video:</strong> {r.video_filename || "—"}</p>
+                  <p><strong>OCR detected:</strong> {r.ocr_success ? "Yes" : "No"}</p>
                 </div>
               )}
             </div>

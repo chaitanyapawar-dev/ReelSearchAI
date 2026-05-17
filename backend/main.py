@@ -45,6 +45,18 @@ except Exception as e:
     print(f"[ERROR] Embedding model failed to load: {e}")
 
 # ---------------------------------------------------------------------------
+# Startup: load OCR reader (EasyOCR — English + Hindi, CPU only)
+# ---------------------------------------------------------------------------
+print("[INFO] Loading OCR reader...")
+try:
+    import easyocr
+    ocr_reader = easyocr.Reader(["en", "hi"], gpu=False, verbose=False)
+    print("[INFO] OCR reader loaded successfully.")
+except Exception as e:
+    ocr_reader = None
+    print(f"[WARN] OCR reader failed to load (OCR will be skipped): {e}")
+
+# ---------------------------------------------------------------------------
 # Startup: initialize ChromaDB
 # ---------------------------------------------------------------------------
 print("[INFO] Initializing ChromaDB...")
@@ -75,6 +87,12 @@ BASE_DIR = Path(__file__).parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 AUDIO_DIR = DOWNLOADS_DIR / "audio"
 TRANSCRIPTS_DIR = DOWNLOADS_DIR / "transcripts"
+OCR_DIR = DOWNLOADS_DIR / "ocr"
+FRAMES_DIR = DOWNLOADS_DIR / "frames"
+
+# Step 8 — OCR performance settings
+FRAME_INTERVAL_SECONDS = 2
+MAX_FRAMES = 30
 
 # Search logs directory (Step 7)
 SEARCH_LOGS_DIR = BASE_DIR / "search_logs"
@@ -82,6 +100,8 @@ SEARCH_LOGS_DIR.mkdir(exist_ok=True)
 
 # Serve downloaded files as static assets
 DOWNLOADS_DIR.mkdir(exist_ok=True)
+OCR_DIR.mkdir(exist_ok=True)
+FRAMES_DIR.mkdir(exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOADS_DIR)), name="downloads")
 
 
@@ -167,16 +187,94 @@ def transcribe_audio(audio_path: Path, transcript_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# STEP 8 — OCR helpers
+# ---------------------------------------------------------------------------
+import cv2
+
+def extract_frames(video_path: Path, frames_dir: Path, doc_id: str) -> list:
+    """Sample frames from video every FRAME_INTERVAL_SECONDS up to MAX_FRAMES."""
+    print("[INFO] Extracting video frames...")
+    frame_paths = []
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        interval = int(fps * FRAME_INTERVAL_SECONDS)
+        frame_idx = 0
+        saved = 0
+        while saved < MAX_FRAMES:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % interval == 0:
+                out_path = frames_dir / f"{doc_id}_f{saved:03d}.jpg"
+                cv2.imwrite(str(out_path), frame)
+                frame_paths.append(out_path)
+                saved += 1
+            frame_idx += 1
+        cap.release()
+        print(f"[INFO] Extracted {len(frame_paths)} frames.")
+    except Exception as e:
+        print(f"[WARN] Frame extraction failed: {e}")
+    return frame_paths
+
+
+def run_ocr(frame_paths: list) -> str:
+    """Run EasyOCR on each frame and return deduplicated text."""
+    if ocr_reader is None:
+        print("[WARN] OCR reader not loaded — skipping OCR.")
+        return ""
+    print("[INFO] Running OCR...")
+    seen = set()
+    lines = []
+    try:
+        for fp in frame_paths:
+            results = ocr_reader.readtext(str(fp), detail=0, paragraph=False)
+            for text in results:
+                clean = text.strip()
+                if clean and clean.lower() not in seen:
+                    seen.add(clean.lower())
+                    lines.append(clean)
+        print(f"[INFO] OCR text extracted successfully ({len(lines)} unique lines).")
+    except Exception as e:
+        print(f"[WARN] OCR failed: {e}")
+    return " ".join(lines)
+
+
+def cleanup_frames(frame_paths: list) -> None:
+    """Delete temporary frame JPGs after OCR."""
+    for fp in frame_paths:
+        try:
+            if Path(fp).exists():
+                os.remove(fp)
+        except Exception:
+            pass
+
+
+def build_combined_document(transcript: str, ocr_text: str) -> str:
+    """Merge Whisper transcript and OCR text into one embedding document."""
+    print("[INFO] Merging transcript and OCR text...")
+    parts = []
+    if transcript.strip():
+        parts.append(f"=== TRANSCRIPT ===\n{transcript.strip()}")
+    if ocr_text.strip():
+        parts.append(f"=== OCR TEXT ===\n{ocr_text.strip()}")
+    return "\n\n".join(parts) if parts else transcript
+
+
+# ---------------------------------------------------------------------------
 # Embedding + ChromaDB store
 # ---------------------------------------------------------------------------
 def store_embedding(
     doc_id: str,
-    transcript: str,
+    combined_document: str,
     video_filename: str,
     audio_filename: str,
     transcript_filename: str,
     original_url: str,
     timestamp: int,
+    ocr_filename: str = "",
+    ocr_text_preview: str = "",
+    ocr_success: bool = False,
 ) -> None:
     if embedding_model is None:
         print("[WARN] Embedding model not loaded — skipping vector storage.")
@@ -186,20 +284,23 @@ def store_embedding(
         return
 
     try:
-        embedding = embedding_model.encode(transcript).tolist()
+        embedding = embedding_model.encode(combined_document).tolist()
         chroma_collection.add(
             ids=[doc_id],
             embeddings=[embedding],
-            documents=[transcript],
+            documents=[combined_document],
             metadatas=[{
                 "video_filename": video_filename,
                 "audio_filename": audio_filename,
                 "transcript_filename": transcript_filename,
                 "original_url": original_url,
                 "timestamp": str(timestamp),
+                "ocr_filename": ocr_filename,
+                "ocr_text_preview": ocr_text_preview[:300],
+                "ocr_success": str(ocr_success),
             }],
         )
-        print(f"[INFO] Embedding stored for {doc_id}.")
+        print(f"[INFO] Combined embedding generated and stored for {doc_id}.")
     except Exception as e:
         print(f"[WARN] Failed to store embedding: {e}")
 
@@ -314,15 +415,42 @@ def download_reel(request: DownloadRequest):
     # --- 3. Transcribe ---
     transcript_text = transcribe_audio(audio_path, transcript_path)
 
-    # --- 4. Store embedding ---
+    # --- 4. OCR: extract frames → run OCR → cleanup frames ---
+    FRAMES_DIR.mkdir(exist_ok=True)
+    OCR_DIR.mkdir(exist_ok=True)
+    ocr_filename = f"{doc_id}_ocr.txt"
+    ocr_path = OCR_DIR / ocr_filename
+    ocr_text = ""
+    ocr_success = False
+    try:
+        frame_paths = extract_frames(video_path, FRAMES_DIR, doc_id)
+        if frame_paths:
+            ocr_text = run_ocr(frame_paths)
+            cleanup_frames(frame_paths)
+        if ocr_text.strip():
+            ocr_path.write_text(ocr_text, encoding="utf-8")
+            ocr_success = True
+        else:
+            ocr_filename = ""
+    except Exception as e:
+        print(f"[WARN] OCR pipeline failed (continuing without OCR): {e}")
+        ocr_filename = ""
+
+    # --- 5. Build combined document (transcript + OCR) ---
+    combined_document = build_combined_document(transcript_text, ocr_text)
+
+    # --- 6. Store embedding ---
     store_embedding(
         doc_id=doc_id,
-        transcript=transcript_text,
+        combined_document=combined_document,
         video_filename=video_filename,
         audio_filename=audio_filename,
         transcript_filename=transcript_filename,
         original_url=url,
         timestamp=timestamp,
+        ocr_filename=ocr_filename,
+        ocr_text_preview=ocr_text[:300] if ocr_text else "",
+        ocr_success=ocr_success,
     )
 
     return {
@@ -330,6 +458,9 @@ def download_reel(request: DownloadRequest):
         "video_filename": video_filename,
         "audio_filename": audio_filename,
         "transcript_filename": transcript_filename,
+        "ocr_filename": ocr_filename,
+        "ocr_success": ocr_success,
+        "ocr_text_preview": ocr_text[:300] if ocr_text else "",
         "video_path": str(video_path),
         "audio_path": str(audio_path),
         "transcript_path": str(transcript_path),
@@ -397,6 +528,8 @@ def search_reels(request: SearchRequest):
             "transcript_preview": transcript_text,
             "transcript_length": len(transcript_text),
             "original_url": meta.get("original_url", ""),
+            "ocr_success": meta.get("ocr_success", "False") == "True",
+            "ocr_text_preview": meta.get("ocr_text_preview", ""),
         })
 
     # --- Persist search log ---
@@ -452,6 +585,11 @@ def get_library():
         audio_path = AUDIO_DIR / audio_filename if audio_filename else None
         transcript_path = TRANSCRIPTS_DIR / transcript_filename if transcript_filename else None
 
+        ocr_filename = meta.get("ocr_filename", "")
+        ocr_path = OCR_DIR / ocr_filename if ocr_filename else None
+        ocr_success = meta.get("ocr_success", "False") == "True"
+        ocr_text_preview = meta.get("ocr_text_preview", "")
+
         reels.append({
             "id": doc_id,
             "original_url": original_url,
@@ -461,10 +599,12 @@ def get_library():
             "transcript_path": str(transcript_path) if transcript_path else "",
             "transcript_preview": transcript_text,
             "timestamp": int(timestamp_str) if timestamp_str.isdigit() else 0,
-            # File existence flags
             "video_exists": video_path.exists() if video_path else False,
             "audio_exists": audio_path.exists() if audio_path else False,
             "transcript_exists": transcript_path.exists() if transcript_path else False,
+            "ocr_success": ocr_success,
+            "ocr_text_preview": ocr_text_preview,
+            "ocr_exists": ocr_path.exists() if ocr_path else False,
         })
 
     # Sort newest first
@@ -498,6 +638,7 @@ def delete_reel(reel_id: str):
     video_filename = meta.get("video_filename", "")
     audio_filename = meta.get("audio_filename", "")
     transcript_filename = meta.get("transcript_filename", "")
+    ocr_filename = meta.get("ocr_filename", "")
 
     # --- Safe file deletion (continue even if files are missing) ---
     files_to_delete = []
@@ -507,6 +648,8 @@ def delete_reel(reel_id: str):
         files_to_delete.append(AUDIO_DIR / audio_filename)
     if transcript_filename:
         files_to_delete.append(TRANSCRIPTS_DIR / transcript_filename)
+    if ocr_filename:
+        files_to_delete.append(OCR_DIR / ocr_filename)
 
     for file_path in files_to_delete:
         try:
@@ -554,16 +697,15 @@ def reindex_reel(reel_id: str):
 
     meta = metadatas[0]
     transcript_filename = meta.get("transcript_filename", "")
+    ocr_filename = meta.get("ocr_filename", "")
 
     if not transcript_filename:
         raise HTTPException(status_code=400, detail="No transcript filename found in metadata.")
 
     transcript_path = TRANSCRIPTS_DIR / transcript_filename
-
     if not transcript_path.exists():
         raise HTTPException(status_code=404, detail=f"Transcript file not found: {transcript_filename}")
 
-    # Load transcript text
     try:
         transcript_text = transcript_path.read_text(encoding="utf-8").strip()
     except Exception as e:
@@ -572,18 +714,29 @@ def reindex_reel(reel_id: str):
     if not transcript_text:
         raise HTTPException(status_code=400, detail="Transcript file is empty.")
 
-    # Generate fresh embedding
+    # Load OCR text if available
+    ocr_text = ""
+    if ocr_filename:
+        ocr_path = OCR_DIR / ocr_filename
+        if ocr_path.exists():
+            try:
+                ocr_text = ocr_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+    # Build combined document (transcript + OCR)
+    combined_document = build_combined_document(transcript_text, ocr_text)
+
     try:
-        embedding = embedding_model.encode(transcript_text).tolist()
+        embedding = embedding_model.encode(combined_document).tolist()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {str(e)}")
 
-    # Update ChromaDB document
     try:
         chroma_collection.update(
             ids=[reel_id],
             embeddings=[embedding],
-            documents=[transcript_text],
+            documents=[combined_document],
             metadatas=[meta],
         )
         print(f"[INFO] Re-index completed for: {reel_id}")
