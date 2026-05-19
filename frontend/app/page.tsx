@@ -10,9 +10,9 @@ const STEPS = [
   "Converting to MP4",
   "Extracting MP3",
   "Transcribing audio",
-  "Saving transcript",
   "Extracting on-screen text (OCR)",
-  "Storing embedding",
+  "Understanding visuals (AI)",
+  "Generating embedding",
   "Completed",
 ];
 
@@ -59,6 +59,15 @@ type DownloadResult = {
   ocr_filename: string;
   ocr_success: boolean;
   ocr_text_preview: string;
+  // STEP 10
+  visual_captions: string[];
+  visual_caption_count: number;
+  has_visual_understanding: boolean;
+  // STEP 12.5
+  instagram_caption?: string;
+  caption_preview?: string;
+  hashtags?: string[];
+  has_caption?: boolean;
 };
 
 type SearchResult = {
@@ -70,12 +79,55 @@ type SearchResult = {
   original_url: string;
   ocr_success: boolean;
   ocr_text_preview: string;
+  // STEP 9 — LLM fields
+  relevance_label?: "HIGH" | "MEDIUM" | "LOW";
+  llm_reason?: string;
+  original_similarity?: number;
+  reranked_position?: number;
+  // STEP 10
+  visual_captions_preview?: string;
+  visual_caption_count?: number;
+  has_visual_understanding?: boolean;
+  // STEP 11
+  clip_score?: number;
+  has_clip_match?: boolean;
+  // STEP 12.5
+  instagram_caption_preview?: string;
+  hashtags?: string[];
+  has_caption?: boolean;
 };
 
 type SearchResponse = {
   search_id: string;
   execution_time_ms: number;
+  query: string;
+  rewritten_query: string;
+  llm_time_ms: number;
+  llm_rejected: number;
+  llm_warning: string | null;
+  llm_active: boolean;
+  empty_reason?: string;
   results: SearchResult[];
+};
+
+// STEP 12 — RAG Chat types
+type ChatSource = {
+  reel_id: string;
+  score: number;
+  reason: string;
+  video_path?: string;
+  relevance?: string;
+};
+
+type ChatResponse = {
+  answer: string;
+  sources: ChatSource[];
+  used_reels: string[];
+  execution_time_ms: number;
+  llm_time_ms: number;
+  retrieved_count: number;
+  rewritten_query?: string;
+  warning?: string;
 };
 
 type LibraryReel = {
@@ -92,6 +144,15 @@ type LibraryReel = {
   ocr_success: boolean;
   ocr_text_preview: string;
   ocr_exists: boolean;
+  // STEP 10
+  visual_captions_preview?: string;
+  visual_caption_count?: number;
+  has_visual_understanding?: boolean;
+  // STEP 12.5
+  instagram_caption?: string;
+  hashtags?: string[];
+  has_caption?: boolean;
+  caption_length?: number;
 };
 
 type Analytics = {
@@ -153,6 +214,142 @@ function ScoreBar({ score }: { score: number }) {
 }
 
 // ---------------------------------------------------------------------------
+// STEP 9 — RelevanceBadge
+// ---------------------------------------------------------------------------
+function RelevanceBadge({ label }: { label: "HIGH" | "MEDIUM" | "LOW" }) {
+  const styles: Record<string, { bg: string; color: string; border: string }> = {
+    HIGH:   { bg: "rgba(34,197,94,0.15)",  color: "#16a34a", border: "1px solid rgba(34,197,94,0.4)" },
+    MEDIUM: { bg: "rgba(234,179,8,0.15)",  color: "#ca8a04", border: "1px solid rgba(234,179,8,0.4)" },
+    LOW:    { bg: "rgba(249,115,22,0.15)", color: "#ea580c", border: "1px solid rgba(249,115,22,0.4)" },
+  };
+  const s = styles[label] ?? styles.LOW;
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: "4px",
+      padding: "2px 8px", borderRadius: "999px", fontSize: "0.72rem",
+      fontWeight: 700, letterSpacing: "0.05em",
+      background: s.bg, color: s.color, border: s.border,
+    }}>
+      {label === "HIGH" ? "● HIGH" : label === "MEDIUM" ? "◑ MEDIUM" : "○ LOW"}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// STEP 9 — AiReasoningPanel
+// ---------------------------------------------------------------------------
+function AiReasoningPanel({ reason, position }: { reason: string; position?: number }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="ai-reasoning-panel">
+      <button className="ai-reasoning-toggle" onClick={() => setOpen((v) => !v)}>
+        🤖 AI Search Reasoning {open ? "▲" : "▼"}
+        {position !== undefined && <span className="ai-rank-badge">Rank #{position}</span>}
+      </button>
+      {open && (
+        <div className="ai-reasoning-body">
+          <p className="ai-reasoning-text">{reason}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// STEP 10 — VisualCaptionsPanel
+// ---------------------------------------------------------------------------
+function VisualCaptionsPanel({
+  captionsText,
+  count,
+}: {
+  captionsText: string;
+  count: number;
+}) {
+  if (!captionsText || count === 0) return null;
+  // Take up to 2 unique captions for preview
+  const captions = Array.from(new Set(
+    captionsText.split(".").map((c) => c.trim()).filter(Boolean)
+  )).slice(0, 2);
+
+  return (
+    <div className="visual-captions-panel">
+      <span className="visual-captions-badge">🎬 Visual Understanding Detected</span>
+      <div className="visual-captions-list">
+        {captions.map((c, i) => (
+          <span key={i} className="visual-caption-item">"{c}"</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// STEP 11 — VisualSemanticMatchPanel
+// ---------------------------------------------------------------------------
+function VisualSemanticMatchPanel({
+  clipScore,
+  hasClipMatch,
+}: {
+  clipScore: number;
+  hasClipMatch: boolean;
+}) {
+  if (!hasClipMatch || clipScore <= 0.1) return null;
+  const pct = Math.round(clipScore * 100);
+  const isStrong = clipScore >= 0.3;
+  return (
+    <div className="clip-match-panel">
+      <div className="clip-match-header">
+        <span className="clip-match-badge">🎯 Visual Semantic Match</span>
+        <span className="clip-match-pct">{pct}%</span>
+      </div>
+      {isStrong && (
+        <span className="clip-matched-pill">Matched via visual understanding</span>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// STEP 12.5 — HashtagChips
+// ---------------------------------------------------------------------------
+function HashtagChips({ tags }: { tags: string[] }) {
+  if (!tags || tags.length === 0) return null;
+  return (
+    <div className="hashtag-chips">
+      {tags.slice(0, 10).map((t) => (
+        <span key={t} className="hashtag-chip">#{t}</span>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// STEP 12.5 — InstagramCaptionPanel
+// ---------------------------------------------------------------------------
+const CAPTION_PREVIEW_LIMIT = 150;
+
+function InstagramCaptionPanel({ caption, hashtags }: { caption: string; hashtags?: string[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!caption || caption.length < 4) return null;
+  const isLong = caption.length > CAPTION_PREVIEW_LIMIT;
+  const displayed = expanded || !isLong ? caption : caption.slice(0, CAPTION_PREVIEW_LIMIT) + "…";
+  return (
+    <div className="caption-panel">
+      <div className="caption-panel-header">
+        <span className="caption-ig-badge">📸 Instagram Caption</span>
+      </div>
+      <p className="caption-text">{displayed}</p>
+      {isLong && (
+        <button className="caption-toggle" onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "Show less ▲" : "Show full caption ▼"}
+        </button>
+      )}
+      {hashtags && hashtags.length > 0 && <HashtagChips tags={hashtags} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 function formatDate(ts: number): string {
@@ -177,6 +374,11 @@ export default function Home() {
   const [searching, setSearching] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchError, setSearchError] = useState("");
+  // STEP 9 — LLM search meta
+  const [searchRewrittenQuery, setSearchRewrittenQuery] = useState("");
+  const [searchLlmWarning, setSearchLlmWarning] = useState<string | null>(null);
+  const [searchLlmRejected, setSearchLlmRejected] = useState(0);
+  const [searchEmptyReason, setSearchEmptyReason] = useState("");
 
   // --- Library state ---
   const [library, setLibrary] = useState<LibraryReel[]>([]);
@@ -193,10 +395,23 @@ export default function Home() {
   const [evalError, setEvalError] = useState("");
   const [evalSearchId, setEvalSearchId] = useState("");
   const [evalTime, setEvalTime] = useState("");
-  const [feedback, setFeedback] = useState<Record<string, "relevant" | "not_relevant">>({});
+  const [feedback, setFeedback] = useState<Record<string, "relevant" | "not_relevant">>({}); 
   const [showDebug, setShowDebug] = useState(false);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  // STEP 9 — LLM eval meta
+  const [evalRewrittenQuery, setEvalRewrittenQuery] = useState("");
+  const [evalLlmWarning, setEvalLlmWarning] = useState<string | null>(null);
+  const [evalLlmRejected, setEvalLlmRejected] = useState(0);
+  const [evalEmptyReason, setEvalEmptyReason] = useState("");
+  const [evalLlmActive, setEvalLlmActive] = useState(false);
+  const [evalLlmTimeMs, setEvalLlmTimeMs] = useState(0);
+
+  // STEP 12 — RAG Chat state
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatResponse, setChatResponse] = useState<ChatResponse | null>(null);
+  const [chatError, setChatError] = useState("");
 
   // ---------------------------------------------------------------------------
   // Load library
@@ -256,6 +471,31 @@ export default function Home() {
   }
 
   // ---------------------------------------------------------------------------
+  // STEP 12 — sendChatMessage
+  // ---------------------------------------------------------------------------
+  async function sendChatMessage(msg?: string) {
+    const message = (msg ?? chatInput).trim();
+    if (!message) return;
+    setChatError("");
+    setChatResponse(null);
+    setChatLoading(true);
+    try {
+      const res = await fetch(`${API}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      const data: ChatResponse & { detail?: string } = await res.json();
+      if (!res.ok) setChatError(data.detail || "Chat request failed.");
+      else setChatResponse(data);
+    } catch {
+      setChatError("Network error — is the backend running on port 8000?");
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Download handler
   // ---------------------------------------------------------------------------
   async function handleDownload(e: React.FormEvent) {
@@ -293,6 +533,10 @@ export default function Home() {
 
     setSearchError("");
     setSearchResults([]);
+    setSearchRewrittenQuery("");
+    setSearchLlmWarning(null);
+    setSearchLlmRejected(0);
+    setSearchEmptyReason("");
     setSearching(true);
 
     try {
@@ -301,11 +545,17 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: query.trim() }),
       });
-      const data = await res.json();
+      const data: SearchResponse & { detail?: string } = await res.json();
       if (!res.ok) setSearchError(data.detail || "Search failed.");
       else {
         setSearchResults(data.results || []);
-        if ((data.results || []).length === 0) setSearchError("No matching reels found.");
+        setSearchRewrittenQuery(data.rewritten_query || "");
+        setSearchLlmWarning(data.llm_warning || null);
+        setSearchLlmRejected(data.llm_rejected || 0);
+        setSearchEmptyReason(data.empty_reason || "");
+        if ((data.results || []).length === 0) {
+          setSearchError(data.empty_reason || "No matching reels found.");
+        }
       }
     } catch {
       setSearchError("Network error — is the backend running on port 8000?");
@@ -327,6 +577,12 @@ export default function Home() {
     setEvalSearchId("");
     setEvalTime("");
     setFeedback({});
+    setEvalRewrittenQuery("");
+    setEvalLlmWarning(null);
+    setEvalLlmRejected(0);
+    setEvalEmptyReason("");
+    setEvalLlmActive(false);
+    setEvalLlmTimeMs(0);
     setEvalSearching(true);
 
     try {
@@ -342,8 +598,14 @@ export default function Home() {
         setEvalResults(data.results || []);
         setEvalSearchId(data.search_id || "");
         setEvalTime(`${(data.execution_time_ms / 1000).toFixed(2)}s`);
+        setEvalRewrittenQuery(data.rewritten_query || "");
+        setEvalLlmWarning(data.llm_warning || null);
+        setEvalLlmRejected(data.llm_rejected || 0);
+        setEvalEmptyReason(data.empty_reason || "");
+        setEvalLlmActive(data.llm_active || false);
+        setEvalLlmTimeMs(data.llm_time_ms || 0);
         if ((data.results || []).length === 0) {
-          setEvalError("No meaningful semantic match found.");
+          setEvalError(data.empty_reason || "No meaningful semantic match found.");
         }
         loadAnalytics();
       }
@@ -494,6 +756,24 @@ export default function Home() {
                 <TranscriptBox text={downloadResult.ocr_text_preview} />
               </div>
             )}
+            {/* STEP 12.5 — Instagram caption */}
+            {downloadResult.has_caption && downloadResult.instagram_caption && (
+              <div className="media-section">
+                <InstagramCaptionPanel
+                  caption={downloadResult.instagram_caption}
+                  hashtags={downloadResult.hashtags}
+                />
+              </div>
+            )}
+            {/* STEP 10 — Visual understanding */}
+            {downloadResult.has_visual_understanding && downloadResult.visual_captions.length > 0 && (
+              <div className="media-section">
+                <VisualCaptionsPanel
+                  captionsText={downloadResult.visual_captions.join(". ")}
+                  count={downloadResult.visual_caption_count}
+                />
+              </div>
+            )}
             <div className="media-section">
               <h3>Video Preview</h3>
               <video controls src={`${BASE}/${downloadResult.video_filename}`} className="video-player" />
@@ -526,21 +806,59 @@ export default function Home() {
             className="input"
           />
           <button id="search-btn" type="submit" disabled={searching} className="btn btn-search">
-            {searching ? "Searching..." : "Search"}
+            {searching ? "Searching…" : "Search"}
           </button>
         </form>
 
-        {searchError && <div className="error-box">❌ {searchError}</div>}
+        {/* STEP 9 — Rewritten query display */}
+        {searchRewrittenQuery && searchRewrittenQuery !== query && (
+          <div className="rewritten-query-box">
+            <span className="rewritten-label">🧠 AI expanded query:</span>
+            <span className="rewritten-text">{searchRewrittenQuery}</span>
+          </div>
+        )}
+
+        {/* STEP 9 — LLM warning */}
+        {searchLlmWarning && (
+          <div className="llm-warning-box">⚠️ {searchLlmWarning}</div>
+        )}
+
+        {/* STEP 9 — All-rejected empty state */}
+        {searchEmptyReason && searchResults.length === 0 && (
+          <div className="llm-empty-state">
+            <span className="llm-empty-icon">🔍</span>
+            <p>No meaningful semantic memory found for this query.</p>
+            <p className="llm-empty-sub">{searchEmptyReason}</p>
+          </div>
+        )}
+
+        {searchError && !searchEmptyReason && <div className="error-box">❌ {searchError}</div>}
 
         {searchResults.length > 0 && (
           <div id="search-results">
             <h3 className="results-heading">Top Results</h3>
-            {searchResults.map((r) => (
+            {searchResults.map((r, idx) => (
               <div key={r.id} className="search-card">
                 <div className="search-card-header">
                   <span className="search-id">{r.id}</span>
-                  <span className="search-score">Score: <strong>{(r.similarity_score * 100).toFixed(1)}%</strong></span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    {r.relevance_label && <RelevanceBadge label={r.relevance_label} />}
+                    <span className="search-score">Score: <strong>{(r.similarity_score * 100).toFixed(1)}%</strong></span>
+                  </div>
                 </div>
+                {r.llm_reason && <AiReasoningPanel reason={r.llm_reason} position={idx + 1} />}
+                {/* STEP 12.5 — Instagram caption */}
+                {r.has_caption && r.instagram_caption_preview && (
+                  <InstagramCaptionPanel caption={r.instagram_caption_preview} hashtags={r.hashtags} />
+                )}
+                {/* STEP 10 — Visual understanding */}
+                {r.has_visual_understanding && r.visual_captions_preview && (
+                  <VisualCaptionsPanel captionsText={r.visual_captions_preview} count={r.visual_caption_count ?? 0} />
+                )}
+                {/* STEP 11 — CLIP visual semantic match */}
+                {r.has_clip_match && (
+                  <VisualSemanticMatchPanel clipScore={r.clip_score ?? 0} hasClipMatch={r.has_clip_match} />
+                )}
                 <video controls src={`${BASE}/${r.video_filename}`} className="video-player" />
                 <TranscriptBox text={r.transcript_preview} />
                 {r.original_url && (
@@ -550,6 +868,165 @@ export default function Home() {
                 )}
               </div>
             ))}
+          </div>
+        )}
+      </section>
+
+      {/* ================================================================
+          SECTION 2.5: AI REEL MEMORY CHAT (STEP 12)
+      ================================================================ */}
+      <section className="section chat-section">
+        <h2 className="chat-heading">🤖 AI Reel Memory Chat</h2>
+        <p className="section-desc">Ask questions about your saved reels. The AI will retrieve and synthesize insights from your reel library.</p>
+
+        {/* Suggested prompts */}
+        <div className="chat-suggestions">
+          {[
+            "Summarize my motivational reels",
+            "What do my reels teach about discipline?",
+            "Show spiritual themes",
+            "Find consistency advice",
+            "What mindset patterns appear?",
+            "Summarize gym motivation reels",
+          ].map((prompt) => (
+            <button
+              key={prompt}
+              className="chat-suggestion-btn"
+              disabled={chatLoading}
+              onClick={() => { setChatInput(prompt); sendChatMessage(prompt); }}
+            >
+              {prompt}
+            </button>
+          ))}
+        </div>
+
+        {/* Chat input */}
+        <form
+          className="chat-form"
+          onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }}
+        >
+          <input
+            id="chat-input"
+            type="text"
+            className="chat-input"
+            placeholder="Ask about your reel library…"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            disabled={chatLoading}
+          />
+          <button
+            id="chat-send-btn"
+            type="submit"
+            className="btn chat-send-btn"
+            disabled={chatLoading || !chatInput.trim()}
+          >
+            {chatLoading ? "Thinking…" : "Ask AI"}
+          </button>
+        </form>
+
+        {/* Error */}
+        {chatError && <div className="error-box">❌ {chatError}</div>}
+
+        {/* Loading state */}
+        {chatLoading && (
+          <div className="chat-thinking">
+            <div className="chat-thinking-dots">
+              <span /><span /><span />
+            </div>
+            <p className="chat-thinking-text">🤖 Thinking through your reel memory…</p>
+          </div>
+        )}
+
+        {/* Chat response */}
+        {chatResponse && !chatLoading && (
+          <div className="chat-response-box">
+            {/* Timing pills */}
+            <div className="chat-timing-row">
+              <span className="chat-timing-pill">⏱ {chatResponse.execution_time_ms}ms total</span>
+              {chatResponse.llm_time_ms > 0 && (
+                <span className="chat-timing-pill chat-timing-llm">🧠 {chatResponse.llm_time_ms}ms LLM</span>
+              )}
+              {chatResponse.retrieved_count > 0 && (
+                <span className="chat-timing-pill chat-timing-reels">📼 {chatResponse.retrieved_count} reels used</span>
+              )}
+            </div>
+
+            {/* Rewritten query */}
+            {chatResponse.rewritten_query && chatResponse.rewritten_query !== chatInput && (
+              <div className="rewritten-query-box" style={{ marginBottom: "12px" }}>
+                <span className="rewritten-label">🧠 AI expanded:</span>
+                <span className="rewritten-text">{chatResponse.rewritten_query}</span>
+              </div>
+            )}
+
+            {/* Warning */}
+            {chatResponse.warning && (
+              <div className="chat-warning-banner">⚠️ {chatResponse.warning}</div>
+            )}
+
+            {/* AI Answer bubble */}
+            <div className="chat-answer-bubble">
+              <div className="chat-answer-header">
+                <span className="chat-ai-badge">🤖 ReelSearchAI</span>
+              </div>
+              <div className="chat-answer-body">
+                {chatResponse.answer.split("\n").map((line, i) => (
+                  <p key={i} className="chat-answer-line">{line}</p>
+                ))}
+              </div>
+            </div>
+
+            {/* Source reel cards */}
+            {chatResponse.sources.length > 0 && (
+              <div className="chat-sources-panel">
+                <p className="chat-sources-title">📌 Source Reels</p>
+                <div className="chat-sources-grid">
+                  {chatResponse.sources.map((src) => {
+                    const rel = src.relevance ?? "MEDIUM";
+                    const relColors: Record<string, { bg: string; color: string; border: string }> = {
+                      HIGH:   { bg: "rgba(34,197,94,0.12)",  color: "#16a34a", border: "rgba(34,197,94,0.4)" },
+                      MEDIUM: { bg: "rgba(234,179,8,0.12)",  color: "#ca8a04", border: "rgba(234,179,8,0.4)" },
+                      LOW:    { bg: "rgba(249,115,22,0.12)", color: "#ea580c", border: "rgba(249,115,22,0.4)" },
+                    };
+                    const rc = relColors[rel] ?? relColors.MEDIUM;
+                    return (
+                      <div key={src.reel_id} className="chat-source-card">
+                        <div className="chat-source-card-header">
+                          <code className="chat-source-id">{src.reel_id}</code>
+                          <span
+                            className="chat-relevance-badge"
+                            style={{ background: rc.bg, color: rc.color, border: `1px solid ${rc.border}` }}
+                          >
+                            {rel === "HIGH" ? "● HIGH" : rel === "MEDIUM" ? "◑ MED" : "○ LOW"}
+                          </span>
+                        </div>
+                        <div className="chat-source-score">
+                          Match: <strong>{Math.round(src.score * 100)}%</strong>
+                        </div>
+                        {src.reason && (
+                          <p className="chat-source-reason">{src.reason}</p>
+                        )}
+                        {src.video_path && (
+                          <video
+                            controls
+                            src={`${BASE}/${src.video_path}`}
+                            className="video-player chat-source-video"
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Empty state */}
+            {chatResponse.sources.length === 0 && (
+              <div className="chat-empty-state">
+                <span>🔍</span>
+                <p>No meaningful reel memory found.</p>
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -590,6 +1067,14 @@ export default function Home() {
                 <span className="ocr-label">OCR:</span>
                 <span className="ocr-preview-text">{reel.ocr_text_preview.slice(0, 120)}{reel.ocr_text_preview.length > 120 ? "…" : ""}</span>
               </div>
+            )}
+            {/* STEP 12.5 — Instagram caption */}
+            {reel.has_caption && reel.instagram_caption && (
+              <InstagramCaptionPanel caption={reel.instagram_caption} hashtags={reel.hashtags} />
+            )}
+            {/* STEP 10 — Visual understanding */}
+            {reel.has_visual_understanding && reel.visual_captions_preview && (
+              <VisualCaptionsPanel captionsText={reel.visual_captions_preview} count={reel.visual_caption_count ?? 0} />
             )}
             {reel.video_exists && reel.video_filename && (
               <video controls src={`${BASE}/${reel.video_filename}`} className="video-player" />
@@ -671,7 +1156,39 @@ export default function Home() {
 
         {/* Timing */}
         {evalTime && (
-          <p className="eval-timing">⏱ Search completed in {evalTime}</p>
+          <p className="eval-timing">
+            ⏱ Search completed in {evalTime}
+            {evalLlmActive && evalLlmTimeMs > 0 && (
+              <span className="llm-timing-note"> &mdash; LLM reasoning: {(evalLlmTimeMs / 1000).toFixed(1)}s</span>
+            )}
+          </p>
+        )}
+
+        {/* STEP 9 — Rewritten query banner */}
+        {evalRewrittenQuery && evalRewrittenQuery !== evalQuery && (
+          <div className="rewritten-query-box">
+            <span className="rewritten-label">🧠 AI expanded query:</span>
+            <span className="rewritten-text">{evalRewrittenQuery}</span>
+          </div>
+        )}
+
+        {/* STEP 9 — LLM warning */}
+        {evalLlmWarning && <div className="llm-warning-box">⚠️ {evalLlmWarning}</div>}
+
+        {/* STEP 9 — LLM rejected stat */}
+        {evalLlmActive && evalLlmRejected > 0 && (
+          <div className="llm-rejected-note">
+            🚫 LLM filtered out <strong>{evalLlmRejected}</strong> irrelevant result{evalLlmRejected !== 1 ? "s" : ""}
+          </div>
+        )}
+
+        {/* STEP 9 — All-rejected empty state */}
+        {evalEmptyReason && evalResults.length === 0 && !evalError && (
+          <div className="llm-empty-state">
+            <span className="llm-empty-icon">🔍</span>
+            <p>No meaningful semantic memory found for this query.</p>
+            <p className="llm-empty-sub">The AI determined none of the retrieved reels were relevant.</p>
+          </div>
         )}
 
         {evalError && <div className="error-box">❌ {evalError}</div>}
@@ -693,7 +1210,20 @@ export default function Home() {
               <div className="eval-card-header">
                 <span className="eval-rank">#{idx + 1}</span>
                 <span className="search-id">{r.id}</span>
+                {r.relevance_label && <RelevanceBadge label={r.relevance_label} />}
               </div>
+
+              {/* STEP 9 — AI reasoning */}
+              {r.llm_reason && <AiReasoningPanel reason={r.llm_reason} position={idx + 1} />}
+
+              {/* STEP 10 — Visual understanding */}
+              {r.has_visual_understanding && r.visual_captions_preview && (
+                <VisualCaptionsPanel captionsText={r.visual_captions_preview} count={r.visual_caption_count ?? 0} />
+              )}
+              {/* STEP 11 — CLIP visual semantic match */}
+              {r.has_clip_match && (
+                <VisualSemanticMatchPanel clipScore={r.clip_score ?? 0} hasClipMatch={r.has_clip_match} />
+              )}
 
               {/* Confidence bar */}
               <ScoreBar score={r.similarity_score} />
@@ -735,10 +1265,15 @@ export default function Home() {
               {showDebug && (
                 <div className="debug-panel">
                   <p><strong>Reel ID:</strong> {r.id}</p>
-                  <p><strong>Raw similarity:</strong> {r.similarity_score}</p>
+                  <p><strong>Hybrid score:</strong> {r.similarity_score}</p>
+                  <p><strong>Text score:</strong> {(r as any).text_score ?? "—"}</p>
+                  <p><strong>CLIP score:</strong> {r.clip_score !== undefined ? r.clip_score : "—"}</p>
+                  <p><strong>CLIP matched:</strong> {r.has_clip_match ? "✅ Yes" : "No"}</p>
                   <p><strong>Transcript length:</strong> {r.transcript_length} chars</p>
                   <p><strong>Video:</strong> {r.video_filename || "—"}</p>
                   <p><strong>OCR detected:</strong> {r.ocr_success ? "Yes" : "No"}</p>
+                  {r.relevance_label && <p><strong>LLM label:</strong> {r.relevance_label}</p>}
+                  {r.reranked_position !== undefined && <p><strong>Original AI Rank:</strong> #{r.reranked_position}</p>}
                 </div>
               )}
             </div>

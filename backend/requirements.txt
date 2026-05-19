@@ -7,3 +7,8 @@ sentence-transformers
 chromadb
 easyocr
 opencv-python
+requests
+transformers
+torch
+pillow
+numpy
