@@ -38,3 +38,11 @@ Thumbs.db
 *.swo
 .vscode/
 .idea/
+
+# ---- Runtime & Cache ----
+backend/chat_logs/
+backend/temp_caption_frames/
+backend/temp_clip_frames/
+backend/scratch/
+backend/downloads/**/*.part
+

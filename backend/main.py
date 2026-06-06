@@ -5,6 +5,10 @@ import subprocess
 import time
 from pathlib import Path
 import requests
+import uuid
+import asyncio
+from datetime import datetime
+from enum import Enum
 from fastapi.staticfiles import StaticFiles
 
 from fastapi import FastAPI, HTTPException
@@ -39,8 +43,95 @@ except ImportError:
 FFMPEG_PATH = shutil.which("ffmpeg")
 if FFMPEG_PATH:
     print(f"[INFO] FFmpeg found at: {FFMPEG_PATH}")
-else:
-    print("[WARN] FFmpeg not found in PATH. Audio extraction will fail.")
+
+# ---------------------------------------------------------------------------
+# Job management structures
+# ---------------------------------------------------------------------------
+
+class PipelineStage(str, Enum):
+    QUEUED = "Queued"
+    DOWNLOADING = "Downloading"
+    AUDIO_EXTRACT = "Audio Extraction"
+    TRANSCRIBING = "Transcribing"
+    OCR = "OCR"
+    BLIP = "BLIP Captioning"
+    CLIP = "CLIP Embedding"
+    CHROMA = "Storing to ChromaDB"
+    OLLAMA = "LLM Enrichment"
+    FINISHED = "Finished"
+    FAILED = "Failed"
+    COMPLETE = "Complete"
+    ERROR = "Error"
+
+import db
+import os
+
+# Configurable concurrency
+MAX_CONCURRENT_PIPELINES = int(os.getenv("MAX_CONCURRENT_PIPELINES", "2"))
+pipeline_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PIPELINES)
+
+# Active pipeline tasks tracked in memory
+active_pipeline_tasks: dict[str, asyncio.Task] = {}
+job_lock = asyncio.Lock()
+
+
+class JobNotifier:
+    def __init__(self):
+        self.subscribers: dict[str, set[asyncio.Queue]] = {}
+
+    def subscribe(self, job_id: str, queue: asyncio.Queue):
+        self.subscribers.setdefault(job_id, set()).add(queue)
+
+    def unsubscribe(self, job_id: str, queue: asyncio.Queue):
+        if job_id in self.subscribers:
+            self.subscribers[job_id].discard(queue)
+            if not self.subscribers[job_id]:
+                del self.subscribers[job_id]
+
+    def notify(self, job_id: str):
+        if job_id not in self.subscribers:
+            return
+        try:
+            job_state = db._get_job_sync(job_id)
+            if not job_state:
+                return
+            if job_state["status"] == "queued":
+                job_state["queue_position"] = db._get_queue_position_sync(job_id)
+            else:
+                job_state["queue_position"] = 0
+
+            payload = {
+                "type": "job_update",
+                "job": job_state
+            }
+
+            loop = asyncio.get_event_loop()
+
+            def push_to_queue(q: asyncio.Queue, data):
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                q.put_nowait(data)
+
+            for q in list(self.subscribers[job_id]):
+                loop.call_soon_threadsafe(push_to_queue, q, payload)
+        except Exception as e:
+            print(f"[ERROR] Notifier failed for {job_id}: {e}")
+
+job_notifier = JobNotifier()
+
+def update_job(job_id: str, **kwargs):
+    """Update job in SQLite and notify listeners."""
+    db._update_job_sync(job_id, **kwargs)
+    job_notifier.notify(job_id)
+
+def log_job(job_id: str, message: str, level: str = "INFO"):
+    """Log to SQLite and notify listeners."""
+    db._add_log_sync(job_id, message, level)
+    job_notifier.notify(job_id)
+
 
 # ---------------------------------------------------------------------------
 # Startup: load Whisper model on CPU (int8)
@@ -285,9 +376,86 @@ def llm_rerank(original_query: str, rewritten_query: str, results: list) -> list
 # ---------------------------------------------------------------------------
 app = FastAPI()
 
+@app.on_event("startup")
+async def startup_event():
+    print("[INFO] Running database initialization...")
+    await db.init_db()
+    print("[INFO] Running database recovery hook...")
+    await db.recover_orphaned_jobs()
+    print("[INFO] Startup sequence completed.")
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint – provides system status without crashing
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health_check():
+    try:
+        # Basic metrics – safe fallbacks if any component missing
+        total_reels = 0
+        total_embeddings = 0
+        total_transcripts = 0
+        active_downloads = 0
+        processing_queue = 0
+
+        if chroma_collection is not None:
+            total_reels = chroma_collection.count()
+            # embeddings count – for now assume one embedding per reel
+            total_embeddings = total_reels
+
+        # Transcript count – iterate over stored metadata if accessible
+        try:
+            # Fetch all metadata (could be large, but acceptable for small dev set)
+            all_meta = chroma_collection.get(include=["metadatas"]).get("metadatas", [])
+            total_transcripts = sum(1 for m in all_meta if m.get("transcript"))
+        except Exception:
+            total_transcripts = 0
+
+        # Placeholder values for download/processing queues – replace with real trackers if available
+        active_downloads = len(active_pipeline_tasks)
+        processing_queue = 0
+
+        active_jobs_cnt = await db.get_active_jobs_count()
+
+        return {
+            "success": True,
+            "backendOnline": True,
+            "ollamaOnline": OLLAMA_AVAILABLE,
+            "chromaOnline": chroma_collection is not None,
+            "gpuAvailable": torch.cuda.is_available() if 'torch' in globals() else False,
+            "gpu": torch.cuda.is_available() if 'torch' in globals() else False,
+            "totalReels": total_reels,
+            "totalEmbeddings": total_embeddings,
+            "totalTranscripts": total_transcripts,
+            "processingQueue": processing_queue,
+            "activeDownloads": active_downloads,
+            "activeJobs": active_jobs_cnt,
+            "latency": 12,
+            "models": {
+                "whisper": "loaded" if whisper_model else "missing",
+                "clip": "loaded" if clip_model_inst else "missing",
+                "blip": "loaded" if blip_model else "missing",
+                "embedding": "loaded" if embedding_model else "missing",
+            },
+        }
+    except Exception as e:
+        # Log the error but return a minimal health payload so frontend stays stable
+        print(f"[WARN] /health endpoint failed: {e}")
+        return {
+            "success": False,
+            "backendOnline": False,
+        }
+
+@app.get("/api/health")
+async def api_health_check():
+    return await health_check()
+
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -739,6 +907,8 @@ def generate_clip_embeddings(frame_paths: list) -> dict:
                 inputs = clip_processor_model(images=img, return_tensors="pt")
                 with torch.no_grad():
                     features = clip_model_inst.get_image_features(**inputs)
+                    if hasattr(features, "pooler_output"):
+                        features = features.pooler_output
                     features = _F.normalize(features, dim=-1)
                 embeddings.append(features[0].cpu().numpy())
             except Exception as frame_err:
@@ -768,6 +938,8 @@ def get_clip_query_embedding(query: str) -> list | None:
         )
         with torch.no_grad():
             features = clip_model_inst.get_text_features(**inputs)
+            if hasattr(features, "pooler_output"):
+                features = features.pooler_output
             features = _F.normalize(features, dim=-1)
         return features[0].cpu().tolist()
     except Exception as e:
@@ -934,187 +1106,360 @@ def load_all_logs() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Ingestion endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/download")
-def download_reel(request: DownloadRequest):
+async def download_reel(request: DownloadRequest):
+    """Create a job for the given Instagram URL and start processing in background.
+    Returns the job_id immediately. Duplicate active URLs share the same job.
+    Only reuses jobs that are still queued or running — not completed/failed ones.
+    """
     url = request.url.strip()
-
     if not url:
         raise HTTPException(status_code=400, detail="URL is required.")
-
     if "instagram.com" not in url:
         raise HTTPException(status_code=400, detail="Invalid Instagram URL.")
 
-    DOWNLOADS_DIR.mkdir(exist_ok=True)
-    AUDIO_DIR.mkdir(exist_ok=True)
-    TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+    async with job_lock:
+        existing_job_id = await db.get_active_job_by_url(url)
+        if existing_job_id:
+            existing_job = await db.get_job(existing_job_id)
+            if existing_job and existing_job.get("status") in ("queued", "running"):
+                return {
+                    "job_id": existing_job_id,
+                    "status": existing_job["status"],
+                }
 
-    timestamp = int(time.time())
-    doc_id = f"reel_{timestamp}"
-    video_filename = f"{doc_id}.mp4"
-    audio_filename = f"{doc_id}.mp3"
-    transcript_filename = f"{doc_id}.txt"
+        # Create a new job entry in DB
+        job_id = uuid.uuid4().hex
+        await db.create_job(job_id, url)
 
-    video_path = DOWNLOADS_DIR / video_filename
-    audio_path = AUDIO_DIR / audio_filename
-    transcript_path = TRANSCRIPTS_DIR / transcript_filename
+    # Store the task so it can be cancelled/inspected later
+    task = asyncio.create_task(run_pipeline(job_id, url))
+    active_pipeline_tasks[job_id] = task
+    return {"job_id": job_id, "status": "queued"}
 
-    # --- 1. Download video ---
-    ydl_opts = {
-        "outtmpl": str(video_path),
-        "format": "best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-    }
+@app.post("/api/jobs")
+async def api_download_reel(request: DownloadRequest):
+    return await download_reel(request)
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                raise HTTPException(status_code=400, detail="Could not extract video info. The reel may be unavailable.")
-    except yt_dlp.utils.DownloadError as e:
-        msg = str(e).replace("ERROR: ", "").strip()
-        if "private" in msg.lower() or "login" in msg.lower() or "checkpoint" in msg.lower():
-            raise HTTPException(status_code=403, detail="This reel is private or requires Instagram login.")
-        if "not found" in msg.lower() or "does not exist" in msg.lower() or "404" in msg:
-            raise HTTPException(status_code=404, detail="Reel not found. The URL may be incorrect or deleted.")
-        raise HTTPException(status_code=400, detail=f"Download failed: {msg}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-    # Resolve actual saved file (yt-dlp may modify the extension)
-    if not video_path.exists():
-        matches = [f for f in DOWNLOADS_DIR.iterdir() if f.name.startswith(doc_id) and f.is_file()]
-        if not matches:
-            raise HTTPException(status_code=500, detail="Video file was not saved after download.")
-        video_path = matches[0]
-        video_filename = video_path.name
+# ---------------------------------------------------------------------------
+# Background pipeline implementation
+# ---------------------------------------------------------------------------
+async def run_pipeline(job_id: str, url: str):
+    """Runs the full ingestion pipeline for a job, updating job state throughout.
+    NOTE: Do NOT raise HTTP exceptions here — this is a background async task.
+    Use plain exceptions (RuntimeError, ValueError) instead.
+    """
+    async with pipeline_semaphore:
+        try:
+            update_job(job_id, status="running", stage=PipelineStage.DOWNLOADING, progress=5)
+            log_job(job_id, "Starting video download")
 
-    # --- 2. Extract audio ---
-    extract_audio(video_path, audio_path)
+            # --- 1. Download video ---
+            temp_video_path = DOWNLOADS_DIR / f"{job_id}_temp.mp4"
+            ydl_opts = {
+                "outtmpl": str(temp_video_path),
+                "format": "best[ext=mp4]/best",
+                "quiet": True,
+                "no_warnings": True,
+            }
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            except yt_dlp.utils.DownloadError as e:
+                raise RuntimeError(f"Download failed: {str(e).replace('ERROR: ', '').strip()}")
+            except Exception as e:
+                raise RuntimeError(f"Unexpected download error: {str(e)}")
 
-    # --- 3. Transcribe ---
-    transcript_text = transcribe_audio(audio_path, transcript_path)
+            video_path = temp_video_path
+            if not video_path.exists():
+                matches = [f for f in DOWNLOADS_DIR.iterdir() if f.is_file() and f.name.startswith(job_id)]
+                if not matches:
+                    raise RuntimeError("Video file was not saved after download.")
+                video_path = matches[0]
+            video_filename = video_path.name
+            update_job(job_id, stage=PipelineStage.DOWNLOADING, progress=15)
+            log_job(job_id, "Video downloaded successfully")
 
-    # --- 4. OCR: extract frames → run OCR → cleanup frames ---
-    FRAMES_DIR.mkdir(exist_ok=True)
-    OCR_DIR.mkdir(exist_ok=True)
-    ocr_filename = f"{doc_id}_ocr.txt"
-    ocr_path = OCR_DIR / ocr_filename
-    ocr_text = ""
-    ocr_success = False
-    try:
-        frame_paths = extract_frames(video_path, FRAMES_DIR, doc_id)
-        if frame_paths:
-            ocr_text = run_ocr(frame_paths)
-            cleanup_frames(frame_paths)
-        if ocr_text.strip():
-            ocr_path.write_text(ocr_text, encoding="utf-8")
-            ocr_success = True
-        else:
-            ocr_filename = ""
-    except Exception as e:
-        print(f"[WARN] OCR pipeline failed (continuing without OCR): {e}")
-        ocr_filename = ""
+            # --- 2. Extract audio ---
+            audio_path = AUDIO_DIR / f"{job_id}.mp3"
+            transcript_path = TRANSCRIPTS_DIR / f"{job_id}.txt"
+            try:
+                extract_audio(video_path, audio_path)
+            except Exception as e:
+                raise RuntimeError(f"Audio extraction failed: {str(e)}")
+            update_job(job_id, stage=PipelineStage.AUDIO_EXTRACT, progress=30)
+            log_job(job_id, "Audio extracted")
 
-    # --- 5. STEP 10: Visual captioning with BLIP ---
-    visual_captions_list: list = []
-    visual_captions_text = ""
-    has_visual_understanding = False
-    try:
-        blip_frame_paths = extract_caption_frames(video_path, doc_id)
-        if blip_frame_paths:
-            blip_result = generate_visual_captions(blip_frame_paths)
-            cleanup_blip_frames(blip_frame_paths)
-            visual_captions_list = blip_result.get("captions", [])
-            visual_captions_text = blip_result.get("combined_caption_text", "")
-            has_visual_understanding = len(visual_captions_list) > 0
-    except Exception as e:
-        print(f"[WARN] Visual captioning pipeline failed (continuing without BLIP): {e}")
+            # --- 3. Transcribe ---
+            try:
+                transcript_text = transcribe_audio(audio_path, transcript_path)
+            except Exception as e:
+                raise RuntimeError(f"Transcription failed: {str(e)}")
+            update_job(job_id, stage=PipelineStage.TRANSCRIBING, progress=45)
+            log_job(job_id, "Whisper transcription completed")
 
-    # --- 6. STEP 11: CLIP visual semantic embedding ---
-    clip_embedding_vec = None
-    clip_frame_count = 0
-    has_clip_embedding = False
-    try:
-        clip_frame_paths = extract_clip_frames(video_path, doc_id)
-        if clip_frame_paths:
-            clip_result = generate_clip_embeddings(clip_frame_paths)
-            cleanup_clip_frames(clip_frame_paths)
-            clip_embedding_vec = clip_result.get("clip_embedding")
-            clip_frame_count = clip_result.get("frame_count", 0)
-            has_clip_embedding = clip_embedding_vec is not None
-            if has_clip_embedding:
-                store_clip_embedding(doc_id, clip_embedding_vec, clip_frame_count)
-    except Exception as e:
-        print(f"[WARN] CLIP embedding pipeline failed (continuing without CLIP): {e}")
+            # --- 4. OCR ---
+            FRAMES_DIR.mkdir(exist_ok=True)
+            OCR_DIR.mkdir(exist_ok=True)
+            ocr_text = ""
+            ocr_success = False
+            try:
+                frame_paths = extract_frames(video_path, FRAMES_DIR, job_id)
+                if frame_paths:
+                    ocr_text = run_ocr(frame_paths)
+                    cleanup_frames(frame_paths)
+                if ocr_text.strip():
+                    (OCR_DIR / f"{job_id}_ocr.txt").write_text(ocr_text, encoding="utf-8")
+                    ocr_success = True
+            except Exception as e:
+                log_job(job_id, f"OCR step error (continuing): {e}")
+            update_job(job_id, stage=PipelineStage.OCR, progress=55)
+            log_job(job_id, "OCR step completed")
 
-    # --- 7. STEP 12.5: Instagram caption extraction ---
-    caption_info = extract_instagram_caption(info if isinstance(info, dict) else {})
-    instagram_caption = caption_info["caption"]
-    hashtags          = caption_info["hashtags"]
-    has_caption       = caption_info["has_caption"]
-    caption_length    = caption_info["caption_length"]
+            # --- 5. BLIP visual captioning ---
+            visual_captions_text = ""
+            visual_captions_list: list = []
+            has_visual_understanding = False
+            try:
+                blip_frame_paths = extract_caption_frames(video_path, job_id)
+                if blip_frame_paths:
+                    blip_result = generate_visual_captions(blip_frame_paths)
+                    cleanup_blip_frames(blip_frame_paths)
+                    visual_captions_list = blip_result.get("captions", [])
+                    visual_captions_text = blip_result.get("combined_caption_text", "")
+                    has_visual_understanding = len(visual_captions_list) > 0
+            except Exception as e:
+                log_job(job_id, f"BLIP captioning error (continuing): {e}")
+            update_job(job_id, stage=PipelineStage.BLIP, progress=70)
+            log_job(job_id, "BLIP captioning completed")
 
-    # --- 8. Build multimodal document (caption + hashtags + transcript + OCR + visual) ---
-    combined_document = build_multimodal_document(
-        transcript_text,
-        ocr_text,
-        visual_captions_text,
-        instagram_caption=instagram_caption,
-        hashtags=hashtags,
-    )
+            # --- 6. CLIP embedding ---
+            clip_embedding_vec = None
+            clip_frame_count = 0
+            has_clip_embedding = False
+            try:
+                clip_frame_paths = extract_clip_frames(video_path, job_id)
+                if clip_frame_paths:
+                    clip_result = generate_clip_embeddings(clip_frame_paths)
+                    cleanup_clip_frames(clip_frame_paths)
+                    clip_embedding_vec = clip_result.get("clip_embedding")
+                    clip_frame_count = clip_result.get("frame_count", 0)
+                    has_clip_embedding = clip_embedding_vec is not None
+                    if has_clip_embedding:
+                        store_clip_embedding(job_id, clip_embedding_vec, clip_frame_count)
+            except Exception as e:
+                log_job(job_id, f"CLIP embedding error (continuing): {e}")
+            update_job(job_id, stage=PipelineStage.CLIP, progress=80)
+            log_job(job_id, "CLIP embedding completed")
 
-    # --- 9. Store text embedding (ChromaDB reels collection) ---
-    store_embedding(
-        doc_id=doc_id,
-        combined_document=combined_document,
-        video_filename=video_filename,
-        audio_filename=audio_filename,
-        transcript_filename=transcript_filename,
-        original_url=url,
-        timestamp=timestamp,
-        ocr_filename=ocr_filename,
-        ocr_text_preview=ocr_text[:300] if ocr_text else "",
-        ocr_success=ocr_success,
-        visual_captions=visual_captions_text,
-        visual_caption_count=len(visual_captions_list),
-        has_visual_understanding=has_visual_understanding,
-        has_clip_embedding=has_clip_embedding,
-        clip_frame_count=clip_frame_count,
-        instagram_caption=instagram_caption,
-        hashtags=hashtags,
-        has_caption=has_caption,
-        caption_length=caption_length,
-    )
+            # --- 7. Instagram caption & hashtags ---
+            caption_info = extract_instagram_caption(info if isinstance(info, dict) else {})
+            instagram_caption = caption_info["caption"]
+            hashtags = caption_info["hashtags"]
+            has_caption = caption_info["has_caption"]
+            caption_length = caption_info["caption_length"]
+            log_job(job_id, "Instagram caption extracted")
+
+            # --- 8. Build multimodal document ---
+            combined_document = build_multimodal_document(
+                transcript_text,
+                ocr_text,
+                visual_captions_text,
+                instagram_caption=instagram_caption,
+                hashtags=hashtags,
+            )
+
+            # --- 9. Ollama semantic enrichment (BEFORE Chroma) ---
+            update_job(job_id, stage=PipelineStage.OLLAMA, progress=85)
+            log_job(job_id, "Ollama semantic enrichment started")
+            ollama_result = {}
+            if OLLAMA_AVAILABLE:
+                try:
+                    _ollama_prompt = (
+                        "You are a semantic memory indexer for short-form video content.\n"
+                        "Analyze the following multimodal content from an Instagram Reel and return STRICT JSON.\n"
+                        "Return ONLY a JSON object with these exact keys:\n"
+                        "  \"summary\": a 2-3 sentence summary of what this reel is about\n"
+                        "  \"topics\": an array of 3-5 main topics covered\n"
+                        "  \"tags\": an array of 5-10 searchable keyword tags\n"
+                        "  \"semantic_memory\": a single paragraph capturing the core meaning for memory retrieval\n"
+                        "  \"searchable_context\": a dense paragraph optimised for semantic similarity search\n"
+                        "Do NOT include any text outside the JSON object.\n\n"
+                        f"Content:\n{combined_document[:3000]}"
+                    )
+                    raw_ollama = call_ollama(_ollama_prompt)
+                    if raw_ollama:
+                        clean_ollama = raw_ollama.strip()
+                        if clean_ollama.startswith("```"):
+                            lines = clean_ollama.splitlines()
+                            clean_ollama = "\n".join(ln for ln in lines if not ln.strip().startswith("```"))
+                        try:
+                            ollama_result = json.loads(clean_ollama)
+                        except Exception:
+                            ollama_result = {"summary": raw_ollama[:500]}
+                    log_job(job_id, "Ollama semantic enrichment completed")
+                except Exception as e:
+                    log_job(job_id, f"Ollama enrichment error (continuing): {e}")
+            else:
+                log_job(job_id, "Ollama unavailable — skipping semantic enrichment")
+
+            # --- 10. Store embeddings in ChromaDB ---
+            update_job(job_id, stage=PipelineStage.CHROMA, progress=93)
+            log_job(job_id, "Storing to ChromaDB started")
+            try:
+                store_embedding(
+                    doc_id=job_id,
+                    combined_document=combined_document,
+                    video_filename=video_filename,
+                    audio_filename=audio_path.name,
+                    transcript_filename=transcript_path.name,
+                    original_url=url,
+                    timestamp=int(time.time()),
+                    ocr_filename=f"{job_id}_ocr.txt" if ocr_success else "",
+                    ocr_text_preview=ocr_text[:300] if ocr_text else "",
+                    ocr_success=ocr_success,
+                    visual_captions=visual_captions_text,
+                    visual_caption_count=len(visual_captions_list),
+                    has_visual_understanding=has_visual_understanding,
+                    has_clip_embedding=has_clip_embedding,
+                    clip_frame_count=clip_frame_count,
+                    instagram_caption=instagram_caption,
+                    hashtags=hashtags,
+                    has_caption=has_caption,
+                    caption_length=caption_length,
+                )
+            except Exception as e:
+                raise RuntimeError(f"ChromaDB persistence failed: {str(e)}")
+            log_job(job_id, "ChromaDB persistence completed")
+
+            # --- FINAL: mark completed ---
+            update_job(
+                job_id,
+                status="completed",
+                stage=PipelineStage.FINISHED,
+                progress=100,
+                result={
+                    "transcript": transcript_text[:500] if transcript_text else "",
+                    "ocr": ocr_text[:300] if ocr_text else "",
+                    "captions": visual_captions_list[:5],
+                    "ollama": ollama_result,
+                    "hashtags": hashtags,
+                    "video_filename": video_filename,
+                },
+            )
+            log_job(job_id, "Pipeline completed successfully")
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            err_msg = str(exc)
+            log_job(job_id, f"Pipeline failed: {err_msg}")
+            update_job(
+                job_id,
+                status="failed",
+                stage=PipelineStage.FAILED,
+                error=err_msg,
+            )
+
+        finally:
+            # Always clean up task registry
+            active_pipeline_tasks.pop(job_id, None)
+
+
+
+# ---------------------------------------------------------------------------
+# Endpoint to fetch job status
+# ---------------------------------------------------------------------------
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Calculate queue position dynamically
+    if job.get("status") == "queued":
+        queue_position = await db.get_queue_position(job_id)
+    else:
+        queue_position = 0
 
     return {
-        "success": True,
-        "video_filename": video_filename,
-        "audio_filename": audio_filename,
-        "transcript_filename": transcript_filename,
-        "ocr_filename": ocr_filename,
-        "ocr_success": ocr_success,
-        "ocr_text_preview": ocr_text[:300] if ocr_text else "",
-        "video_path": str(video_path),
-        "audio_path": str(audio_path),
-        "transcript_path": str(transcript_path),
-        "transcript_preview": transcript_text,
-        # STEP 10
-        "visual_captions": visual_captions_list,
-        "visual_caption_count": len(visual_captions_list),
-        "has_visual_understanding": has_visual_understanding,
-        # STEP 11
-        "has_clip_embedding": has_clip_embedding,
-        "clip_frame_count": clip_frame_count,
-        # STEP 12.5
-        "instagram_caption": instagram_caption,
-        "caption_preview": instagram_caption[:200] if instagram_caption else "",
-        "hashtags": hashtags,
-        "has_caption": has_caption,
+        "job_id": job["job_id"],
+        "url": job.get("url"),
+        "status": job.get("status"),
+        "stage": job.get("stage"),
+        "progress": job.get("progress"),
+        "logs": job.get("logs", []),
+        "error": job.get("error"),
+        "result": job.get("result"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "queue_position": queue_position,
     }
+
+@app.get("/api/jobs/{job_id}")
+async def api_get_job(job_id: str):
+    return await get_job(job_id)
+
+@app.get("/api/jobs")
+async def api_list_jobs(limit: int = 50, offset: int = 0, status: str = None):
+    jobs_list = await db.list_jobs(limit=limit, offset=offset, status=status)
+    for j in jobs_list:
+        if j.get("status") == "queued":
+            j["queue_position"] = await db.get_queue_position(j["job_id"])
+        else:
+            j["queue_position"] = 0
+    return jobs_list
+
+from fastapi.responses import StreamingResponse
+
+@app.get("/api/jobs/{job_id}/stream")
+async def api_stream_job(job_id: str):
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    async def event_generator():
+        q = asyncio.Queue(maxsize=100)
+        job_notifier.subscribe(job_id, q)
+        
+        try:
+            # Yield initial state immediately
+            job_state = await db.get_job(job_id)
+            if job_state:
+                if job_state.get("status") == "queued":
+                    job_state["queue_position"] = await db.get_queue_position(job_id)
+                else:
+                    job_state["queue_position"] = 0
+                yield f"data: {json.dumps({'type': 'job_update', 'job': job_state})}\n\n"
+
+            while True:
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    q.task_done()
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            # Handle client disconnect
+            print(f"[INFO] SSE stream client disconnected for job {job_id}")
+            raise
+        finally:
+            job_notifier.unsubscribe(job_id, q)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no", # disable nginx buffering
+        }
+    )
+
 
 
 @app.post("/search")
@@ -1394,6 +1739,10 @@ def search_reels(request: SearchRequest):
         "results": output,
     }
 
+@app.post("/api/search")
+def api_search_reels(request: SearchRequest):
+    return search_reels(request)
+
 
 # ---------------------------------------------------------------------------
 # STEP 6 — Feature 1: GET /library
@@ -1472,6 +1821,25 @@ def get_library():
 
     return {"success": True, "reels": reels}
 
+@app.get("/api/reels")
+def api_get_reels(limit: int = 20, offset: int = 0, search: str = None):
+    """Frontend-compatible /api/reels endpoint with pagination."""
+    full = get_library()
+    all_reels = full.get("reels", [])
+    # Apply search filter if provided
+    if search:
+        search_lower = search.lower()
+        all_reels = [
+            r for r in all_reels
+            if search_lower in r.get("video_filename", "").lower()
+            or search_lower in r.get("transcript_preview", "").lower()
+            or search_lower in r.get("ocr_text_preview", "").lower()
+            or search_lower in r.get("instagram_caption", "").lower()
+        ]
+    total = len(all_reels)
+    page = all_reels[offset:offset + limit]
+    return {"reels": page, "total": total, "limit": limit, "offset": offset}
+
 
 # ---------------------------------------------------------------------------
 # STEP 6 — Feature 3: DELETE /delete/{reel_id}
@@ -1532,6 +1900,10 @@ def delete_reel(reel_id: str):
     delete_clip_embedding(reel_id)
 
     return {"success": True}
+
+@app.delete("/api/reels/{reel_id}")
+def api_delete_reel(reel_id: str):
+    return delete_reel(reel_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1678,6 +2050,10 @@ def reindex_reel(reel_id: str):
         "clip_frame_count": clip_frame_count,
     }
 
+@app.post("/api/reels/{reel_id}/reindex")
+def api_reindex_reel(reel_id: str):
+    return reindex_reel(reel_id)
+
 
 # ---------------------------------------------------------------------------
 # STEP 7 — Feature 2 & 3: POST /feedback
@@ -1715,6 +2091,10 @@ def save_feedback(request: FeedbackRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save feedback: {str(e)}")
 
     return {"success": True}
+
+@app.post("/api/feedback")
+def api_save_feedback(request: FeedbackRequest):
+    return save_feedback(request)
 
 
 # ---------------------------------------------------------------------------
@@ -1798,6 +2178,10 @@ def get_search_analytics():
         "top_queries": top_queries,
         "worst_queries": worst_queries,
     }
+
+@app.get("/api/search-analytics")
+def api_get_search_analytics():
+    return get_search_analytics()
 
 
 # ===========================================================================
@@ -2206,3 +2590,113 @@ def chat_with_reels(request: ChatRequest):
         rewritten_query=rewritten_query,
         warning=llm_warning,
     )
+
+@app.post("/api/chat")
+def api_chat_with_reels(request: ChatRequest):
+    return chat_with_reels(request)
+
+
+# ---------------------------------------------------------------------------
+# API aliases: /api/dashboard/stats, /api/dashboard/activity, /api/system/health
+# These bridge the frontend expectations to existing backend logic.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/dashboard/stats")
+async def api_dashboard_stats():
+    """Aggregate dashboard statistics from health + analytics data."""
+    health_data = await health_check()
+    analytics_data = get_search_analytics()
+
+    # Count completed / failed jobs from DB
+    all_jobs = await db.list_jobs(limit=10000, offset=0)
+    completed_jobs = sum(1 for j in all_jobs if j.get("status") == "completed")
+    failed_jobs = sum(1 for j in all_jobs if j.get("status") == "failed")
+
+    return {
+        "reels_indexed": health_data.get("totalReels", 0),
+        "vectors_stored": health_data.get("totalEmbeddings", 0),
+        "transcripts": health_data.get("totalTranscripts", 0),
+        "active_jobs": health_data.get("activeJobs", 0),
+        "completed_jobs": completed_jobs,
+        "failed_jobs": failed_jobs,
+        "total_searches": analytics_data.get("total_searches", 0),
+        "avg_match_score": analytics_data.get("avg_similarity", 0),
+        "ollama_online": health_data.get("ollamaOnline", False),
+        "chromadb_online": health_data.get("chromaOnline", False),
+        "api_online": True,
+        "gpu_available": health_data.get("gpuAvailable", False),
+        "latency_ms": health_data.get("latency", 0),
+        "models": health_data.get("models", {}),
+    }
+
+
+@app.get("/api/dashboard/activity")
+async def api_dashboard_activity(limit: int = 20):
+    """Return recent activity from job completions/failures."""
+    all_jobs = await db.list_jobs(limit=limit, offset=0)
+    activity = []
+    for job in all_jobs:
+        if job.get("status") == "completed":
+            activity.append({
+                "type": "indexed",
+                "message": f"Reel indexed from {job.get('url', 'unknown')}",
+                "timestamp": job.get("updated_at", job.get("created_at", "")),
+            })
+        elif job.get("status") == "failed":
+            activity.append({
+                "type": "error",
+                "message": f"Pipeline failed: {(job.get('error') or 'unknown error')[:80]}",
+                "timestamp": job.get("updated_at", job.get("created_at", "")),
+            })
+    return activity[:limit]
+
+
+@app.get("/api/system/health")
+async def api_system_health():
+    """Detailed system health for Settings page."""
+    import shutil
+    health_data = await health_check()
+    models = health_data.get("models", {})
+
+    # Compute storage sizes
+    storage_used_mb = 0
+    db_size_mb = 0
+    vector_db_size_mb = 0
+    try:
+        dl_dir = Path(__file__).parent / "downloads"
+        if dl_dir.exists():
+            storage_used_mb = round(sum(f.stat().st_size for f in dl_dir.rglob("*") if f.is_file()) / (1024 * 1024), 2)
+    except Exception:
+        pass
+    try:
+        db_file = Path(__file__).parent / "vector_db" / "jobs.db"
+        if db_file.exists():
+            db_size_mb = round(db_file.stat().st_size / (1024 * 1024), 2)
+    except Exception:
+        pass
+    try:
+        vdb_dir = Path(__file__).parent / "vector_db"
+        if vdb_dir.exists():
+            vector_db_size_mb = round(sum(f.stat().st_size for f in vdb_dir.rglob("*") if f.is_file()) / (1024 * 1024), 2)
+    except Exception:
+        pass
+
+    return {
+        "api_online": True,
+        "ollama_online": health_data.get("ollamaOnline", False),
+        "chromadb_online": health_data.get("chromaOnline", False),
+        "whisper_loaded": models.get("whisper") == "loaded",
+        "whisper_model": "medium",
+        "whisper_device": "cpu",
+        "whisper_compute": "int8",
+        "clip_loaded": models.get("clip") == "loaded",
+        "blip_loaded": models.get("blip") == "loaded",
+        "embedding_loaded": models.get("embedding") == "loaded",
+        "gpu_available": health_data.get("gpuAvailable", False),
+        "storage_used_mb": storage_used_mb,
+        "db_size_mb": db_size_mb,
+        "vector_db_size_mb": vector_db_size_mb,
+        "max_concurrent_pipelines": MAX_CONCURRENT_PIPELINES,
+        "active_pipelines": len(active_pipeline_tasks),
+        "latency_ms": health_data.get("latency", 0),
+    }
